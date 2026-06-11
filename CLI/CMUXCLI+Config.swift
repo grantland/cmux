@@ -703,3 +703,77 @@ extension CMUXCLI {
         return "unknown config parse error"
     }
 }
+
+// MARK: - Named remote transport resolution (`cmux ssh --transport <name>`)
+
+/// CLI-local decode of the `remoteTransports` section of cmux.json. The canonical model lives in
+/// `Sources/CmuxConfig.swift` (`CmuxRemoteTransportDefinition`); the CLI decodes a minimal subset so
+/// it does not depend on the full app config model. Keep the field names in sync with the schema.
+private struct CLIRemoteTransportEntry: Decodable {
+    var exec: [String]
+    var env: [String: String]?
+    var remoteDaemonPath: String?
+}
+
+private struct CLIRemoteTransportsFile: Decodable {
+    var remoteTransports: [String: CLIRemoteTransportEntry]?
+}
+
+extension CMUXCLI {
+    private func globalCmuxConfigPath() -> String {
+        let fileManager = FileManager.default
+        let rawHome = ProcessInfo.processInfo.environment["HOME"] ?? fileManager.homeDirectoryForCurrentUser.path
+        return (URL(fileURLWithPath: rawHome).standardizedFileURL.path as NSString)
+            .appendingPathComponent(".config/cmux/cmux.json")
+    }
+
+    private func decodeRemoteTransports(atPath path: String) -> [String: CLIRemoteTransportEntry] {
+        guard let data = FileManager.default.contents(atPath: path),
+              let sanitized = try? JSONCParser.preprocess(data: data),
+              let file = try? JSONDecoder().decode(CLIRemoteTransportsFile.self, from: sanitized) else {
+            return [:]
+        }
+        return file.remoteTransports ?? [:]
+    }
+
+    /// Merges global (`~/.config/cmux/cmux.json`) then project-local `remoteTransports`; local wins.
+    private func loadRemoteTransports() -> [String: CLIRemoteTransportEntry] {
+        var merged = decodeRemoteTransports(atPath: globalCmuxConfigPath())
+        if let projectPath = findProjectConfigPath() {
+            for (key, value) in decodeRemoteTransports(atPath: projectPath) {
+                merged[key] = value
+            }
+        }
+        return merged
+    }
+
+    private func substituteTransportPlaceholders(_ value: String, host: String, port: Int?, user: String?) -> String {
+        var out = value.replacingOccurrences(of: "%host", with: host)
+        if let port { out = out.replacingOccurrences(of: "%port", with: String(port)) }
+        if let user { out = out.replacingOccurrences(of: "%user", with: user) }
+        return out
+    }
+
+    /// Resolves a named transport from cmux.json, substituting `%host`/`%port`/`%user`.
+    /// Throws `CLIError` when the name is not defined.
+    func resolveExecTransport(name: String, host: String, port: Int?, user: String?) throws
+        -> (exec: [String], env: [String: String], remoteDaemonPath: String?) {
+        let transports = loadRemoteTransports()
+        guard let entry = transports[name] else {
+            let available = transports.keys.sorted().joined(separator: ", ")
+            let hint = available.isEmpty
+                ? "No remoteTransports are defined in cmux.json."
+                : "Available: \(available)."
+            throw CLIError(message: "ssh: unknown --transport '\(name)'. \(hint)")
+        }
+        let exec = entry.exec.map { substituteTransportPlaceholders($0, host: host, port: port, user: user) }
+        var env: [String: String] = [:]
+        for (key, value) in (entry.env ?? [:]) {
+            env[key] = substituteTransportPlaceholders(value, host: host, port: port, user: user)
+        }
+        let remoteDaemonPath = entry.remoteDaemonPath.map {
+            substituteTransportPlaceholders($0, host: host, port: port, user: user)
+        }
+        return (exec, env, remoteDaemonPath)
+    }
+}

@@ -7986,6 +7986,7 @@ struct CMUXCLI {
         var execEnvironment: [String: String] = [:]
         var remoteDaemonPath: String?
         var skipDaemonUpload = false
+        var transportName: String?
 
         var passthrough = false
         var index = 0
@@ -8046,6 +8047,12 @@ struct CMUXCLI {
                     sshOptions.append(value)
                 }
                 index += 2
+            case "--transport":
+                guard index + 1 < commandArgs.count else {
+                    throw CLIError(message: "ssh: --transport requires a name defined in cmux.json remoteTransports")
+                }
+                transportName = commandArgs[index + 1]
+                index += 2
             case "--transport-exec":
                 guard index + 1 < commandArgs.count else {
                     throw CLIError(message: "ssh: --transport-exec requires a command (e.g. 'docker exec -i %host')")
@@ -8095,6 +8102,34 @@ struct CMUXCLI {
         guard let destination else {
             throw CLIError(message: "ssh requires a destination (example: cmux ssh user@host)")
         }
+
+        // Resolve a named transport from cmux.json (cmux ssh --transport <name> <host>).
+        if let transportName {
+            guard execCommand.isEmpty else {
+                throw CLIError(message: "ssh: --transport and --transport-exec are mutually exclusive")
+            }
+            let transportUser: String?
+            let transportHost: String
+            if let at = destination.firstIndex(of: "@"), at != destination.startIndex {
+                transportUser = String(destination[..<at])
+                transportHost = String(destination[destination.index(after: at)...])
+            } else {
+                transportUser = nil
+                transportHost = destination
+            }
+            let resolved = try resolveExecTransport(
+                name: transportName,
+                host: transportHost,
+                port: port,
+                user: transportUser
+            )
+            execCommand = resolved.exec
+            execEnvironment = resolved.env
+            if let resolvedDaemonPath = resolved.remoteDaemonPath {
+                remoteDaemonPath = resolvedDaemonPath
+            }
+        }
+
         let agentForwarding = resolvedSSHAgentForwarding(
             sshOptions: sshOptions,
             override: forwardAgentOverride
