@@ -339,11 +339,10 @@ struct WorkspaceRemoteConfiguration: Equatable {
     /// `.exec` transport only: extra environment variables for the spawned wrapper
     /// (e.g. `["AWS_REGION": "us-east-1"]`). Merged over the inherited process environment.
     let execEnvironment: [String: String]
-    /// `.exec` transport only: absolute path of the pre-placed `cmuxd-remote` binary on the remote.
+    /// `.exec` transport only: absolute path of a pre-placed `cmuxd-remote` binary on the remote.
+    /// When set, the bootstrap skips probe+upload and performs a real `hello` at this path; when
+    /// nil, the daemon is auto-uploaded over the exec channel.
     let remoteDaemonPath: String?
-    /// Skip the probe + upload bootstrap and use a pre-placed daemon (`remoteDaemonPath`).
-    /// The live RPC client still performs a real `hello` handshake over the transport.
-    let skipDaemonUpload: Bool
 
     init(
         transport: WorkspaceRemoteTransport = .ssh,
@@ -365,8 +364,7 @@ struct WorkspaceRemoteConfiguration: Equatable {
         skipDaemonBootstrap: Bool = false,
         execCommand: [String] = [],
         execEnvironment: [String: String] = [:],
-        remoteDaemonPath: String? = nil,
-        skipDaemonUpload: Bool = false
+        remoteDaemonPath: String? = nil
     ) {
         self.transport = transport
         self.destination = destination
@@ -390,7 +388,6 @@ struct WorkspaceRemoteConfiguration: Equatable {
         self.execCommand = execCommand
         self.execEnvironment = execEnvironment
         self.remoteDaemonPath = remoteDaemonPath
-        self.skipDaemonUpload = skipDaemonUpload
     }
 
     /// Resolves the SSH agent socket to use for a remote configuration from an explicit socket or durable options.

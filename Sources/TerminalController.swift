@@ -5497,7 +5497,6 @@ class TerminalController {
         let execCommand = v2StringArray(params, "transport_exec") ?? []
         let execEnvironment = v2StringMap(params, "transport_env") ?? [:]
         let remoteDaemonPath = v2RawString(params, "remote_daemon_path")
-        let skipDaemonUpload = v2Bool(params, "skip_daemon_upload") ?? false
         if transport == .exec, execCommand.isEmpty {
             return .err(
                 code: "invalid_params",
@@ -5575,8 +5574,7 @@ class TerminalController {
                 skipDaemonBootstrap: skipDaemonBootstrap,
                 execCommand: execCommand,
                 execEnvironment: execEnvironment,
-                remoteDaemonPath: remoteDaemonPath?.isEmpty == true ? nil : remoteDaemonPath,
-                skipDaemonUpload: skipDaemonUpload
+                remoteDaemonPath: remoteDaemonPath?.isEmpty == true ? nil : remoteDaemonPath
             )
             workspace.configureRemoteConnection(config, autoConnect: autoConnect)
             notifyRemotePTYControllerAvailabilityChanged()

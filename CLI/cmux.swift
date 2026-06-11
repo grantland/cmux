@@ -7481,7 +7481,6 @@ struct CMUXCLI {
         let execCommand: [String]
         let execEnvironment: [String: String]
         let remoteDaemonPath: String?
-        let skipDaemonUpload: Bool
 
         init(
             destination: String,
@@ -7499,8 +7498,7 @@ struct CMUXCLI {
             skipDaemonBootstrap: Bool = false,
             execCommand: [String] = [],
             execEnvironment: [String: String] = [:],
-            remoteDaemonPath: String? = nil,
-            skipDaemonUpload: Bool = false
+            remoteDaemonPath: String? = nil
         ) {
             self.destination = destination
             self.displayDestination = displayDestination ?? destination
@@ -7518,7 +7516,6 @@ struct CMUXCLI {
             self.execCommand = execCommand
             self.execEnvironment = execEnvironment
             self.remoteDaemonPath = remoteDaemonPath
-            self.skipDaemonUpload = skipDaemonUpload
         }
     }
 
@@ -7878,9 +7875,6 @@ struct CMUXCLI {
                 if let remoteDaemonPath = sshOptions.remoteDaemonPath {
                     configureParams["remote_daemon_path"] = remoteDaemonPath
                 }
-                if sshOptions.skipDaemonUpload {
-                    configureParams["skip_daemon_upload"] = true
-                }
             }
             if let persistentDaemonSlot {
                 configureParams["preserve_after_terminal_exit"] = true
@@ -7985,7 +7979,6 @@ struct CMUXCLI {
         var execCommand: [String] = []
         var execEnvironment: [String: String] = [:]
         var remoteDaemonPath: String?
-        var skipDaemonUpload = false
         var transportName: String?
 
         var passthrough = false
@@ -8078,9 +8071,6 @@ struct CMUXCLI {
                 }
                 remoteDaemonPath = commandArgs[index + 1]
                 index += 2
-            case "--skip-daemon-upload":
-                skipDaemonUpload = true
-                index += 1
             default:
                 if arg.hasPrefix("--") {
                     throw CLIError(message: "ssh: unknown flag '\(arg)'")
@@ -8148,8 +8138,7 @@ struct CMUXCLI {
             remoteRelayPort: remoteRelayPort,
             execCommand: execCommand,
             execEnvironment: execEnvironment,
-            remoteDaemonPath: remoteDaemonPath,
-            skipDaemonUpload: skipDaemonUpload
+            remoteDaemonPath: remoteDaemonPath
         )
     }
 
