@@ -98,7 +98,7 @@ Environment:
 | `move-tab-to-new-workspace` | Move a tab or surface into a newly created workspace. |
 | `list-workspaces` | List workspaces. |
 | `new-workspace` | Create a workspace, optionally with cwd, command, description, and layout. |
-| `ssh` | Open an SSH-backed workspace. Preserves the caller's live `SSH_AUTH_SOCK` for app-launched OpenSSH processes so `ForwardAgent yes` from ssh_config works normally. Supports `-A` / `--forward-agent` to request forwarding and `-a` / `--no-forward-agent` to disable forwarding for a workspace. Agent forwarding remains opt-in because forwarded agents can be used by processes on the remote host while the SSH session is active. |
+| `ssh` | Open a remote workspace. By default uses OpenSSH; preserves the caller's live `SSH_AUTH_SOCK` for app-launched OpenSSH processes so `ForwardAgent yes` from ssh_config works normally. Supports `-A` / `--forward-agent` to request forwarding and `-a` / `--no-forward-agent` to disable forwarding for a workspace. Agent forwarding remains opt-in because forwarded agents can be used by processes on the remote host while the SSH session is active. **Generic transports:** `--transport <name>` opens the workspace through a `remoteTransports` entry from `cmux.json` instead of OpenSSH (see "Generic remote transports" below); `--transport-exec '<cmd>'` (repeatable, with optional `--transport-env KEY=VAL` and `--remote-daemon-path <path>`) does the same ad-hoc without a config entry. `--transport` and `--transport-exec` are mutually exclusive. |
 | `remote-daemon-status` | Print bundled remote daemon version, asset, checksum, and cache status. |
 | `ssh-session-list` | List persisted SSH PTY sessions for one remote workspace or all remote workspaces. Supports `--json`. |
 | `ssh-session-attach` | Create a local terminal surface that reattaches to an existing persisted SSH PTY session. |
@@ -170,6 +170,35 @@ Environment:
 | `ssh-pty-attach` | Internal helper used by SSH terminal startup scripts to bridge a local terminal surface to a remote PTY session. |
 | `ssh-session-end` | Internal helper that clears remote SSH session state. |
 | `__tmux-compat` | Internal tmux compatibility dispatcher. |
+
+## Generic remote transports
+
+`cmux ssh` can open a remote workspace through any command whose stdio carries the cmux daemon
+RPC, not just OpenSSH. This covers hosts that aren't reachable by stock `ssh` — e.g. `docker exec`,
+`kubectl exec`, AWS SSM, or corp SSH wrappers. It is the same idea as `ssh`'s `ProxyCommand` or
+`git`'s `core.sshCommand`, applied at cmux's transport layer.
+
+Define named transports in `cmux.json` under `remoteTransports`:
+
+```jsonc
+{
+  "remoteTransports": {
+    "docker": { "exec": ["docker", "exec", "-i", "%host"] },
+    "k8s":    { "exec": ["kubectl", "exec", "-i", "%host", "--"] }
+  }
+}
+```
+
+Then: `cmux ssh --transport docker <container>` or `cmux ssh --transport k8s <pod>`.
+
+- `exec` is the wrapper argv; cmux appends the daemon command and bridges its stdio. The
+  `%host`, `%port`, and `%user` placeholders (derived from `<destination>` / `--port`) are
+  substituted at connect time.
+- Optional per-transport fields: `env` (environment overrides, also placeholder-substituted) and
+  `remoteDaemonPath` (an absolute path to a pre-placed `cmuxd-remote`, which skips auto-upload).
+- Without `remoteDaemonPath`, cmux auto-uploads the release-pinned `cmuxd-remote` over the
+  transport's stdio on first connect (probe platform → stream the binary → verify → run).
+- Ad-hoc, without a config entry: `cmux ssh --transport-exec 'docker exec -i %host' [--transport-env KEY=VAL] [--remote-daemon-path <path>] <container>`.
 
 ## Command Families
 
