@@ -33,6 +33,28 @@ final class CmuxConfigDecodingTests: XCTestCase {
 
     // MARK: Simple commands
 
+    func testDecodeRemoteTransports() throws {
+        let config = try decode("""
+        {
+          "remoteTransports": {
+            "k8s": { "exec": ["kubectl", "exec", "-i", "%host", "--"] },
+            "docker": {
+              "exec": ["docker", "exec", "-i", "%host"],
+              "env": { "FOO": "bar" },
+              "remoteDaemonPath": "/cmuxd-remote"
+            }
+          }
+        }
+        """)
+        XCTAssertEqual(config.remoteTransports?["k8s"]?.exec, ["kubectl", "exec", "-i", "%host", "--"])
+        XCTAssertEqual(config.remoteTransports?["docker"]?.env?["FOO"], "bar")
+        XCTAssertEqual(config.remoteTransports?["docker"]?.remoteDaemonPath, "/cmuxd-remote")
+    }
+
+    func testDecodeRemoteTransportRejectsEmptyExec() {
+        XCTAssertThrowsError(try decode(#"{"remoteTransports":{"x":{"exec":[]}}}"#))
+    }
+
     func testDecodeSimpleCommand() throws {
         let json = """
         {

@@ -208,6 +208,33 @@
         }
       }
     },
+    "remoteTransports": {
+      "type": "object",
+      "title": "remoteTransports",
+      "description": "Named generic remote transports for `cmux ssh --transport <name> <host>`. Each entry's `exec` is the wrapper command whose stdio carries the cmux daemon RPC (e.g. [\"docker\",\"exec\",\"-i\",\"%host\"] or [\"kubectl\",\"exec\",\"-i\",\"%host\",\"--\"]). The %host, %port, and %user placeholders are substituted at connect time.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["exec"],
+        "properties": {
+          "exec": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1,
+            "description": "Wrapper command argv whose stdio carries the daemon RPC. Supports %host/%port/%user placeholders."
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "Environment overrides for the spawned wrapper. Values support %host/%port/%user placeholders."
+          },
+          "remoteDaemonPath": {
+            "type": "string",
+            "description": "Optional absolute path to a pre-placed cmuxd-remote binary on the remote (skips auto-upload)."
+          }
+        }
+      }
+    },
     "surfaceTabBarButtons": {
       "title": "surfaceTabBarButtons",
       "description": "Legacy root-level surface tab bar buttons. Prefer ui.surfaceTabBar.buttons for new configs.",

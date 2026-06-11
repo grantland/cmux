@@ -17,9 +17,10 @@ struct CmuxConfigFile: Codable, Sendable {
     var commands: [CmuxCommandDefinition]
     var vault: CmuxVaultConfigDefinition?
     var workspaceGroups: CmuxConfigWorkspaceGroupsDefinition?
+    var remoteTransports: [String: CmuxRemoteTransportDefinition]?
 
     private enum CodingKeys: String, CodingKey {
-        case actions, ui, notifications, newWorkspaceCommand, surfaceTabBarButtons, commands, vault, workspaceGroups
+        case actions, ui, notifications, newWorkspaceCommand, surfaceTabBarButtons, commands, vault, workspaceGroups, remoteTransports
     }
 
     init(
@@ -30,7 +31,8 @@ struct CmuxConfigFile: Codable, Sendable {
         surfaceTabBarButtons: [CmuxSurfaceTabBarButton]? = nil,
         commands: [CmuxCommandDefinition] = [],
         vault: CmuxVaultConfigDefinition? = nil,
-        workspaceGroups: CmuxConfigWorkspaceGroupsDefinition? = nil
+        workspaceGroups: CmuxConfigWorkspaceGroupsDefinition? = nil,
+        remoteTransports: [String: CmuxRemoteTransportDefinition]? = nil
     ) {
         self.actions = actions
         self.ui = ui
@@ -40,6 +42,7 @@ struct CmuxConfigFile: Codable, Sendable {
         self.commands = commands
         self.vault = vault
         self.workspaceGroups = workspaceGroups
+        self.remoteTransports = remoteTransports
     }
 
     init(from decoder: Decoder) throws {
@@ -90,6 +93,10 @@ struct CmuxConfigFile: Codable, Sendable {
         workspaceGroups = try container.decodeIfPresent(
             CmuxConfigWorkspaceGroupsDefinition.self,
             forKey: .workspaceGroups
+        )
+        remoteTransports = try container.decodeIfPresent(
+            [String: CmuxRemoteTransportDefinition].self,
+            forKey: .remoteTransports
         )
     }
 
@@ -159,6 +166,44 @@ struct CmuxConfigWorkspaceGroupsDefinition: Codable, Sendable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case byCwd
+    }
+}
+
+/// One named generic exec remote transport, used by `cmux ssh --transport <name>`.
+/// `exec` is the wrapper argv whose stdio carries the daemon RPC, e.g.
+/// `["docker","exec","-i","%host"]` or `["kubectl","exec","-i","%host","--"]`.
+/// The `%host` / `%port` / `%user` placeholders are
+/// substituted at connect time. `env` adds environment overrides for the spawned wrapper;
+/// `remoteDaemonPath` optionally points at a pre-placed daemon binary (skips auto-upload).
+struct CmuxRemoteTransportDefinition: Codable, Sendable, Hashable {
+    var exec: [String]
+    var env: [String: String]?
+    var remoteDaemonPath: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case exec, env, remoteDaemonPath
+    }
+
+    init(exec: [String], env: [String: String]? = nil, remoteDaemonPath: String? = nil) {
+        self.exec = exec
+        self.env = env
+        self.remoteDaemonPath = remoteDaemonPath
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedExec = try container.decode([String].self, forKey: .exec)
+        guard !decodedExec.isEmpty,
+              let first = decodedExec.first?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !first.isEmpty else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .exec, in: container,
+                debugDescription: "remoteTransports entry 'exec' must be a non-empty command array with a non-blank executable"
+            )
+        }
+        exec = decodedExec
+        env = try container.decodeIfPresent([String: String].self, forKey: .env)
+        remoteDaemonPath = try container.decodeIfPresent(String.self, forKey: .remoteDaemonPath)
     }
 }
 
