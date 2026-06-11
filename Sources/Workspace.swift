@@ -6969,17 +6969,17 @@ final class WorkspaceRemoteSessionController {
             let requiredCapabilities = requiredDaemonCapabilities
             let hello: DaemonHello
             if configuration.transport == .exec {
-                // Generic exec transport (ek/docker/kubectl/...): the daemon binary is
-                // pre-placed at `remoteDaemonPath`. Skip the ssh-shaped probe/upload/one-shot
-                // hello; the live RPC client performs a real `hello` over the exec channel.
-                let execRemotePath = configuration.remoteDaemonPath ?? "cmuxd-remote"
-                hello = DaemonHello(
-                    name: "cmuxd-remote",
-                    version: "exec",
-                    capabilities: requiredCapabilities,
-                    remotePath: execRemotePath
-                )
-                debugLog("remote.bootstrap.skipped reason=exec remotePath=\(execRemotePath)")
+                if let overridePath = configuration.remoteDaemonPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !overridePath.isEmpty {
+                    // Pre-placed daemon (pre-baked image or explicit config): skip probe/upload and
+                    // perform a real hello at the configured path over the exec channel.
+                    hello = try helloRemoteDaemonLocked(remotePath: overridePath)
+                    debugLog("remote.bootstrap.exec.preplaced remotePath=\(overridePath)")
+                } else {
+                    // Auto-upload over the exec channel: probe platform, upload the manifest-pinned
+                    // binary, and hello — the same bootstrap as ssh, routed through the exec transport.
+                    hello = try bootstrapDaemonLocked(requiredCapabilities: requiredCapabilities)
+                }
             } else if configuration.skipDaemonBootstrap {
                 // Cloud-VM path: cmuxd-remote is pre-baked in the image and exposed via
                 // systemd socket activation at /run/cmuxd-remote.sock. We skip the probe,
@@ -7786,6 +7786,49 @@ final class WorkspaceRemoteSessionController {
         )
     }
 
+    /// Generic exec primitive: spawn the configured `execCommand` wrapper followed by `remoteArgv`,
+    /// forwarding `stdin`. Mirrors `sshExec`/`scpExec` for the ssh path.
+    private func execSpawn(remoteArgv: [String], stdin: Data?, timeout: TimeInterval) throws -> CommandResult {
+        let exec = configuration.execCommand
+        guard let first = exec.first else {
+            throw NSError(domain: "cmux.remote.daemon", code: 25, userInfo: [
+                NSLocalizedDescriptionKey: "exec transport requires a non-empty command",
+            ])
+        }
+        let executable: String
+        let arguments: [String]
+        // GUI apps inherit a minimal PATH; resolve a bare executable name via `env`.
+        if first.hasPrefix("/") {
+            executable = first
+            arguments = Array(exec.dropFirst()) + remoteArgv
+        } else {
+            executable = "/usr/bin/env"
+            arguments = exec + remoteArgv
+        }
+        return try runProcess(
+            executable: executable,
+            arguments: arguments,
+            environment: configuration.execProcessEnvironment,
+            stdin: stdin,
+            timeout: timeout
+        )
+    }
+
+    /// Runs a remote `sh` script over whichever transport is configured. For exec the script is fed
+    /// to `sh` via stdin — a single `sh` argv token survives both join-style wrappers (which join
+    /// trailing argv and re-run via a shell) and direct-exec transports (docker/kubectl).
+    /// For ssh, the existing quoted-command form is used.
+    private func runRemoteShellCommandLocked(_ script: String, timeout: TimeInterval = 15) throws -> CommandResult {
+        if configuration.transport == .exec {
+            return try execSpawn(remoteArgv: ["sh"], stdin: Data(script.utf8), timeout: timeout)
+        }
+        let command = "sh -c \(Self.shellSingleQuoted(script))"
+        return try sshExec(
+            arguments: sshCommonArguments(batchMode: true) + [configuration.destination, command],
+            timeout: timeout
+        )
+    }
+
     private func runProcess(
         executable: String,
         arguments: [String],
@@ -8266,8 +8309,7 @@ final class WorkspaceRemoteSessionController {
           printf '%sno\\n' '\(Self.remotePlatformProbeExistsMarker)'
         fi
         """
-        let command = "sh -c \(Self.shellSingleQuoted(script))"
-        let result = try sshExec(arguments: sshCommonArguments(batchMode: true) + [configuration.destination, command], timeout: 20)
+        let result = try runRemoteShellCommandLocked(script, timeout: 20)
 
         let lines = result.stdout
             .split(separator: "\n", omittingEmptySubsequences: false)
@@ -8559,8 +8601,7 @@ final class WorkspaceRemoteSessionController {
         )
 
         let mkdirScript = "mkdir -p \(Self.shellSingleQuoted(remoteDirectory))"
-        let mkdirCommand = "sh -c \(Self.shellSingleQuoted(mkdirScript))"
-        let mkdirResult = try sshExec(arguments: sshCommonArguments(batchMode: true) + [configuration.destination, mkdirCommand], timeout: 12)
+        let mkdirResult = try runRemoteShellCommandLocked(mkdirScript, timeout: 12)
         guard mkdirResult.status == 0 else {
             let detail = Self.bestErrorLine(stderr: mkdirResult.stderr, stdout: mkdirResult.stdout) ?? "ssh exited \(mkdirResult.status)"
             throw NSError(domain: "cmux.remote.daemon", code: 30, userInfo: [
@@ -8568,37 +8609,55 @@ final class WorkspaceRemoteSessionController {
             ])
         }
 
-        let scpSSHOptions = backgroundSSHOptions(configuration.sshOptions)
-        var scpArgs: [String] = ["-q"]
-        if !hasSSHOptionKey(scpSSHOptions, key: "StrictHostKeyChecking") {
-            scpArgs += ["-o", "StrictHostKeyChecking=accept-new"]
-        }
-        scpArgs += ["-o", "ControlMaster=no"]
-        if let port = configuration.port {
-            scpArgs += ["-P", String(port)]
-        }
-        if let identityFile = configuration.identityFile,
-           !identityFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            scpArgs += ["-i", identityFile]
-        }
-        for option in scpSSHOptions {
-            scpArgs += ["-o", option]
-        }
-        scpArgs += [localBinary.path, "\(configuration.destination):\(remoteTempPath)"]
-        let scpResult = try scpExec(arguments: scpArgs, timeout: 45)
-        guard scpResult.status == 0 else {
-            let detail = Self.bestErrorLine(stderr: scpResult.stderr, stdout: scpResult.stdout) ?? "scp exited \(scpResult.status)"
-            throw NSError(domain: "cmux.remote.daemon", code: 31, userInfo: [
-                NSLocalizedDescriptionKey: "failed to upload cmuxd-remote: \(detail)",
-            ])
+        if configuration.transport == .exec {
+            // No scp over a generic exec transport: stream the binary bytes over the exec
+            // channel's stdin into `cat > <tempPath>` on the remote.
+            let binaryData = try Data(contentsOf: localBinary)
+            // `cat>PATH` is a single space-free token (the temp path has no spaces), so it survives
+            // join-style exec transports; the binary streams over the exec channel's stdin.
+            let writeResult = try execSpawn(
+                remoteArgv: ["sh", "-c", "cat>\(remoteTempPath)"],
+                stdin: binaryData,
+                timeout: 60
+            )
+            guard writeResult.status == 0 else {
+                let detail = Self.bestErrorLine(stderr: writeResult.stderr, stdout: writeResult.stdout) ?? "exec write exited \(writeResult.status)"
+                throw NSError(domain: "cmux.remote.daemon", code: 31, userInfo: [
+                    NSLocalizedDescriptionKey: "failed to upload cmuxd-remote: \(detail)",
+                ])
+            }
+        } else {
+            let scpSSHOptions = backgroundSSHOptions(configuration.sshOptions)
+            var scpArgs: [String] = ["-q"]
+            if !hasSSHOptionKey(scpSSHOptions, key: "StrictHostKeyChecking") {
+                scpArgs += ["-o", "StrictHostKeyChecking=accept-new"]
+            }
+            scpArgs += ["-o", "ControlMaster=no"]
+            if let port = configuration.port {
+                scpArgs += ["-P", String(port)]
+            }
+            if let identityFile = configuration.identityFile,
+               !identityFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                scpArgs += ["-i", identityFile]
+            }
+            for option in scpSSHOptions {
+                scpArgs += ["-o", option]
+            }
+            scpArgs += [localBinary.path, "\(configuration.destination):\(remoteTempPath)"]
+            let scpResult = try scpExec(arguments: scpArgs, timeout: 45)
+            guard scpResult.status == 0 else {
+                let detail = Self.bestErrorLine(stderr: scpResult.stderr, stdout: scpResult.stdout) ?? "scp exited \(scpResult.status)"
+                throw NSError(domain: "cmux.remote.daemon", code: 31, userInfo: [
+                    NSLocalizedDescriptionKey: "failed to upload cmuxd-remote: \(detail)",
+                ])
+            }
         }
 
         let finalizeScript = """
         chmod 755 \(Self.shellSingleQuoted(remoteTempPath)) && \
         mv \(Self.shellSingleQuoted(remoteTempPath)) \(Self.shellSingleQuoted(remotePath))
         """
-        let finalizeCommand = "sh -c \(Self.shellSingleQuoted(finalizeScript))"
-        let finalizeResult = try sshExec(arguments: sshCommonArguments(batchMode: true) + [configuration.destination, finalizeCommand], timeout: 12)
+        let finalizeResult = try runRemoteShellCommandLocked(finalizeScript, timeout: 12)
         guard finalizeResult.status == 0 else {
             let detail = Self.bestErrorLine(stderr: finalizeResult.stderr, stdout: finalizeResult.stdout) ?? "ssh exited \(finalizeResult.status)"
             throw NSError(domain: "cmux.remote.daemon", code: 32, userInfo: [
@@ -8674,8 +8733,7 @@ final class WorkspaceRemoteSessionController {
     private func helloRemoteDaemonLocked(remotePath: String) throws -> DaemonHello {
         let request = #"{"id":1,"method":"hello","params":{}}"#
         let script = "printf '%s\\n' \(Self.shellSingleQuoted(request)) | \(Self.shellSingleQuoted(remotePath)) serve --stdio"
-        let command = "sh -c \(Self.shellSingleQuoted(script))"
-        let result = try sshExec(arguments: sshCommonArguments(batchMode: true) + [configuration.destination, command], timeout: 12)
+        let result = try runRemoteShellCommandLocked(script, timeout: 12)
         guard result.status == 0 else {
             let detail = Self.bestErrorLine(stderr: result.stderr, stdout: result.stdout) ?? "ssh exited \(result.status)"
             throw NSError(domain: "cmux.remote.daemon", code: 40, userInfo: [
