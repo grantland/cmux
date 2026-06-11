@@ -7476,6 +7476,12 @@ struct CMUXCLI {
         /// True when the remote is a cloud VM with cmuxd-remote pre-baked in the image.
         /// Set by `cmux vm new/shell/attach`; false for plain `cmux ssh`.
         let skipDaemonBootstrap: Bool
+        /// Generic exec transport (e.g. `["docker","exec","-i","<c>"]`, `["kubectl","exec","-i","<pod>","--"]`).
+        /// Empty means the default ssh transport.
+        let execCommand: [String]
+        let execEnvironment: [String: String]
+        let remoteDaemonPath: String?
+        let skipDaemonUpload: Bool
 
         init(
             destination: String,
@@ -7490,7 +7496,11 @@ struct CMUXCLI {
             agentSocketPath: String? = nil,
             localSocketPath: String,
             remoteRelayPort: Int,
-            skipDaemonBootstrap: Bool = false
+            skipDaemonBootstrap: Bool = false,
+            execCommand: [String] = [],
+            execEnvironment: [String: String] = [:],
+            remoteDaemonPath: String? = nil,
+            skipDaemonUpload: Bool = false
         ) {
             self.destination = destination
             self.displayDestination = displayDestination ?? destination
@@ -7505,6 +7515,10 @@ struct CMUXCLI {
             self.localSocketPath = localSocketPath
             self.remoteRelayPort = remoteRelayPort
             self.skipDaemonBootstrap = skipDaemonBootstrap
+            self.execCommand = execCommand
+            self.execEnvironment = execEnvironment
+            self.remoteDaemonPath = remoteDaemonPath
+            self.skipDaemonUpload = skipDaemonUpload
         }
     }
 
@@ -7735,6 +7749,18 @@ struct CMUXCLI {
             initialSSHStartupCommand = ptyStartupCommand
             remoteTerminalSSHStartupCommand = ptyStartupCommand
         }
+        if !sshOptions.execCommand.isEmpty {
+            // Exec transport: the terminal attaches to the daemon PTY over the (exec) RPC
+            // channel via a local `cmux ssh-pty-attach` (no direct ssh). The daemon PTY bridge
+            // is started by the session controller's exec branch. remoteRelayPort: 0 keeps the
+            // local attach pointed at the app socket (the reverse relay is not used for exec).
+            let execAttachStartup = buildReusableSSHPTYAttachStartupCommand(
+                remoteShellCommand: remoteTerminalBootstrapScript ?? "",
+                remoteRelayPort: 0
+            )
+            initialSSHStartupCommand = execAttachStartup
+            remoteTerminalSSHStartupCommand = execAttachStartup
+        }
         let reusableTerminalStartupCommand: String
         if let vmIDForSplitAttach,
            sshOptions.skipDaemonBootstrap {
@@ -7814,7 +7840,9 @@ struct CMUXCLI {
             var configureParams: [String: Any] = [
                 "workspace_id": workspaceId,
                 "destination": sshOptions.displayDestination,
-                "auto_connect": deferredRemoteReconnectCommandScript == nil,
+                // Exec transport bootstraps the daemon eagerly: its terminal command is a plain
+                // ssh-pty-attach with no deferred-reconnect trigger, so connect must auto-start.
+                "auto_connect": deferredRemoteReconnectCommandScript == nil || !sshOptions.execCommand.isEmpty,
             ]
             if let configuredForegroundAuthToken {
                 configureParams["foreground_auth_token"] = configuredForegroundAuthToken
@@ -7840,6 +7868,19 @@ struct CMUXCLI {
             configureParams["terminal_startup_command"] = reusableTerminalStartupCommand
             if sshOptions.skipDaemonBootstrap {
                 configureParams["skip_daemon_bootstrap"] = true
+            }
+            if !sshOptions.execCommand.isEmpty {
+                configureParams["transport"] = "exec"
+                configureParams["transport_exec"] = sshOptions.execCommand
+                if !sshOptions.execEnvironment.isEmpty {
+                    configureParams["transport_env"] = sshOptions.execEnvironment
+                }
+                if let remoteDaemonPath = sshOptions.remoteDaemonPath {
+                    configureParams["remote_daemon_path"] = remoteDaemonPath
+                }
+                if sshOptions.skipDaemonUpload {
+                    configureParams["skip_daemon_upload"] = true
+                }
             }
             if let persistentDaemonSlot {
                 configureParams["preserve_after_terminal_exit"] = true
@@ -7941,6 +7982,10 @@ struct CMUXCLI {
         var sshOptions: [String] = []
         var extraArguments: [String] = []
         var forwardAgentOverride: Bool?
+        var execCommand: [String] = []
+        var execEnvironment: [String: String] = [:]
+        var remoteDaemonPath: String?
+        var skipDaemonUpload = false
 
         var passthrough = false
         var index = 0
@@ -8001,6 +8046,34 @@ struct CMUXCLI {
                     sshOptions.append(value)
                 }
                 index += 2
+            case "--transport-exec":
+                guard index + 1 < commandArgs.count else {
+                    throw CLIError(message: "ssh: --transport-exec requires a command (e.g. 'docker exec -i %host')")
+                }
+                let tokens = commandArgs[index + 1]
+                    .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                    .map(String.init)
+                execCommand.append(contentsOf: tokens)
+                index += 2
+            case "--transport-env":
+                guard index + 1 < commandArgs.count else {
+                    throw CLIError(message: "ssh: --transport-env requires KEY=VALUE")
+                }
+                let pair = commandArgs[index + 1]
+                guard let eq = pair.firstIndex(of: "="), eq != pair.startIndex else {
+                    throw CLIError(message: "ssh: --transport-env must be KEY=VALUE")
+                }
+                execEnvironment[String(pair[..<eq])] = String(pair[pair.index(after: eq)...])
+                index += 2
+            case "--remote-daemon-path":
+                guard index + 1 < commandArgs.count else {
+                    throw CLIError(message: "ssh: --remote-daemon-path requires a path")
+                }
+                remoteDaemonPath = commandArgs[index + 1]
+                index += 2
+            case "--skip-daemon-upload":
+                skipDaemonUpload = true
+                index += 1
             default:
                 if arg.hasPrefix("--") {
                     throw CLIError(message: "ssh: unknown flag '\(arg)'")
@@ -8037,7 +8110,11 @@ struct CMUXCLI {
             extraArguments: extraArguments,
             agentSocketPath: agentForwarding.agentSocketPath,
             localSocketPath: localSocketPath,
-            remoteRelayPort: remoteRelayPort
+            remoteRelayPort: remoteRelayPort,
+            execCommand: execCommand,
+            execEnvironment: execEnvironment,
+            remoteDaemonPath: remoteDaemonPath,
+            skipDaemonUpload: skipDaemonUpload
         )
     }
 

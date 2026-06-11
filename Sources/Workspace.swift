@@ -2619,6 +2619,9 @@ private final class WorkspaceRemoteDaemonRPCClient {
 
         if configuration.transport == .websocket {
             try startViaWebSocket()
+        } else if configuration.transport == .exec {
+            try startViaExec()
+            markTransportOpen()
         } else if Self.usesSocketForwardTransport(configuration: configuration) {
             try startViaBakedVMSocketForward()
             markTransportOpen()
@@ -2745,6 +2748,91 @@ private final class WorkspaceRemoteDaemonRPCClient {
         } catch {
             throw NSError(domain: "cmux.remote.daemon.rpc", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "Failed to launch SSH daemon transport: \(error.localizedDescription)",
+            ])
+        }
+
+        stateQueue.sync {
+            self.process = process
+            self.stdinHandle = stdinPipe.fileHandleForWriting
+            self.stdoutHandle = stdoutPipe.fileHandleForReading
+            self.stderrHandle = stderrPipe.fileHandleForReading
+        }
+    }
+
+    private func startViaExec() throws {
+        guard let invocation = WorkspaceRemoteExecCommandBuilder.daemonTransportInvocation(
+            execCommand: configuration.execCommand,
+            remotePath: remotePath,
+            persistentDaemonSlot: configuration.persistentDaemonSlot
+        ) else {
+            throw NSError(domain: "cmux.remote.daemon.rpc", code: 20, userInfo: [
+                NSLocalizedDescriptionKey: "exec transport requires a non-empty command",
+            ])
+        }
+
+        let process = Process()
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        stateQueue.sync {
+            self.stdinPipe = stdinPipe
+            self.stdoutPipe = stdoutPipe
+            self.stderrPipe = stderrPipe
+        }
+
+        // GUI apps inherit a minimal PATH, so resolve a bare executable name via `env`.
+        // Absolute paths are spawned directly. Prefer an absolute path in config to avoid PATH surprises.
+        if invocation.executable.hasPrefix("/") {
+            process.executableURL = URL(fileURLWithPath: invocation.executable)
+            process.arguments = invocation.arguments
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [invocation.executable] + invocation.arguments
+        }
+        process.environment = configuration.execProcessEnvironment
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            switch ProcessPipeReader.readAvailableDataOrEndOfFile(from: handle) {
+            case .data(let data):
+                self?.stateQueue.async {
+                    self?.consumeStdoutData(data)
+                }
+            case .wouldBlock:
+                return
+            case .endOfFile:
+                handle.readabilityHandler = nil
+                self?.stateQueue.async {
+                    self?.consumeStdoutData(Data())
+                }
+            }
+        }
+        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            switch ProcessPipeReader.readAvailableDataOrEndOfFile(from: handle) {
+            case .data(let data):
+                self?.stateQueue.async {
+                    self?.consumeStderrData(data)
+                }
+            case .wouldBlock:
+                return
+            case .endOfFile:
+                handle.readabilityHandler = nil
+            }
+        }
+        process.terminationHandler = { [weak self] terminated in
+            self?.stateQueue.async {
+                self?.handleProcessTermination(terminated)
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            throw NSError(domain: "cmux.remote.daemon.rpc", code: 21, userInfo: [
+                NSLocalizedDescriptionKey: "Failed to launch exec daemon transport: \(error.localizedDescription)",
             ])
         }
 
@@ -6880,7 +6968,19 @@ final class WorkspaceRemoteSessionController {
         do {
             let requiredCapabilities = requiredDaemonCapabilities
             let hello: DaemonHello
-            if configuration.skipDaemonBootstrap {
+            if configuration.transport == .exec {
+                // Generic exec transport (ek/docker/kubectl/...): the daemon binary is
+                // pre-placed at `remoteDaemonPath`. Skip the ssh-shaped probe/upload/one-shot
+                // hello; the live RPC client performs a real `hello` over the exec channel.
+                let execRemotePath = configuration.remoteDaemonPath ?? "cmuxd-remote"
+                hello = DaemonHello(
+                    name: "cmuxd-remote",
+                    version: "exec",
+                    capabilities: requiredCapabilities,
+                    remotePath: execRemotePath
+                )
+                debugLog("remote.bootstrap.skipped reason=exec remotePath=\(execRemotePath)")
+            } else if configuration.skipDaemonBootstrap {
                 // Cloud-VM path: cmuxd-remote is pre-baked in the image and exposed via
                 // systemd socket activation at /run/cmuxd-remote.sock. We skip the probe,
                 // upload, and stdio-hello steps entirely — they all depend on ssh-exec
@@ -6931,6 +7031,12 @@ final class WorkspaceRemoteSessionController {
                         detail: String(format: connectedDetailFormat, configuration.displayTarget)
                     )
                 }
+            } else if configuration.transport == .exec {
+                // Exec transport: the reverse relay (remote `cmux` CLI) and the ssh port-scan
+                // TTY bootstrap are ssh-shaped and deferred. The proxy broker hosts the live
+                // RPC client that the PTY bridge uses, so start it to bring up the terminal.
+                debugLog("remote.relay.skipped reason=exec transport=\(configuration.transport.rawValue)")
+                startProxyLocked()
             } else {
                 startReverseRelayLocked(remotePath: hello.remotePath)
                 requestBootstrapRemoteTTYIfNeededLocked()
@@ -7350,6 +7456,9 @@ final class WorkspaceRemoteSessionController {
     }
 
     private func requestBootstrapRemoteTTYIfNeededLocked() {
+        // Exec transport: this probe is ssh-shaped (`sshExec`); skip it (the connect fork
+        // already avoids calling it, but guard here too for any other call sites).
+        guard configuration.transport != .exec else { return }
         guard !bootstrapRemoteTTYResolved else { return }
         guard let relayPort = configuration.relayPort, relayPort > 0 else { return }
         if !remotePortScanTTYNames.isEmpty {
@@ -9410,6 +9519,8 @@ final class WorkspaceRemoteSessionController {
     }
 
     private func scanRemotePortsByPanelLocked(ttyNamesByPanel: [UUID: String]) throws -> [UUID: [Int]] {
+        // Exec transport: port scanning is ssh-shaped; skip until daemon-side detection lands.
+        guard configuration.transport != .exec else { return [:] }
         let ttyNames = Array(Set(ttyNamesByPanel.values)).sorted()
         guard !ttyNames.isEmpty else { return [:] }
 
@@ -9460,6 +9571,12 @@ final class WorkspaceRemoteSessionController {
     }
 
     private func updateRemotePortPollingStateLocked() {
+        // Exec transport: remote port detection is ssh-shaped (`sshExec`) and not yet routed
+        // through the daemon, so disable polling instead of dialing ssh to a non-ssh remote.
+        if configuration.transport == .exec {
+            stopRemotePortPollingLocked()
+            return
+        }
         guard daemonReady, !isStopping, let pollingMode = remotePortPollingModeLocked() else {
             stopRemotePortPollingLocked()
             if !keepPolledRemotePortsUntilTTYScan {

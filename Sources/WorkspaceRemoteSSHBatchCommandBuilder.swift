@@ -153,3 +153,45 @@ enum WorkspaceRemoteSSHBatchCommandBuilder {
         "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 }
+
+/// Builds the spawn invocation for the generic `exec` transport (e.g.
+/// `docker exec -i <container>`, `kubectl exec -i <pod> --`). The user-supplied `execCommand`
+/// argv is the wrapper; the remote daemon command (`<remotePath> serve --stdio [...]`) is
+/// appended so the wrapper runs it on the remote and bridges its stdio.
+nonisolated enum WorkspaceRemoteExecCommandBuilder {
+    /// Returns the executable to spawn and its arguments, or `nil` when `execCommand` is empty.
+    static func daemonTransportInvocation(
+        execCommand: [String],
+        remotePath: String,
+        persistentDaemonSlot: String? = nil
+    ) -> (executable: String, arguments: [String])? {
+        guard let executable = execCommand.first else { return nil }
+        var remoteArgv = [remotePath, "serve", "--stdio"]
+        if let slot = persistentDaemonSlot?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !slot.isEmpty {
+            remoteArgv += ["--persistent", "--slot", slot]
+        }
+        let arguments = Array(execCommand.dropFirst()) + remoteArgv
+        return (executable: executable, arguments: arguments)
+    }
+}
+
+/// Substitutes `%host` / `%port` / `%user` placeholders in a configured exec transport's argv
+/// and environment values. `%port` / `%user` are left literal when the corresponding value is
+/// absent (the caller validates required placeholders); unknown placeholders are left untouched.
+nonisolated enum WorkspaceRemoteExecPlaceholders {
+    static func substitute(_ values: [String], host: String, port: Int?, user: String?) -> [String] {
+        values.map { substituteOne($0, host: host, port: port, user: user) }
+    }
+
+    static func substitute(_ env: [String: String], host: String, port: Int?, user: String?) -> [String: String] {
+        env.mapValues { substituteOne($0, host: host, port: port, user: user) }
+    }
+
+    private static func substituteOne(_ value: String, host: String, port: Int?, user: String?) -> String {
+        var out = value.replacingOccurrences(of: "%host", with: host)
+        if let port { out = out.replacingOccurrences(of: "%port", with: String(port)) }
+        if let user { out = out.replacingOccurrences(of: "%user", with: user) }
+        return out
+    }
+}

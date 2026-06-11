@@ -5493,6 +5493,18 @@ class TerminalController {
             )
         }
         let skipDaemonBootstrap = v2Bool(params, "skip_daemon_bootstrap") ?? false
+        // Generic exec transport (e.g. docker/kubectl): wrapper argv + env + optional pre-placed daemon.
+        let execCommand = v2StringArray(params, "transport_exec") ?? []
+        let execEnvironment = v2StringMap(params, "transport_env") ?? [:]
+        let remoteDaemonPath = v2RawString(params, "remote_daemon_path")
+        let skipDaemonUpload = v2Bool(params, "skip_daemon_upload") ?? false
+        if transport == .exec, execCommand.isEmpty {
+            return .err(
+                code: "invalid_params",
+                message: "transport_exec must be a non-empty command array when transport is exec",
+                data: nil
+            )
+        }
         if persistentDaemonSlot != nil, !preserveAfterTerminalExit {
             return .err(
                 code: "invalid_params",
@@ -5560,7 +5572,11 @@ class TerminalController {
                 daemonWebSocketEndpoint: daemonWebSocketEndpoint,
                 preserveAfterTerminalExit: preserveAfterTerminalExit,
                 persistentDaemonSlot: persistentDaemonSlot?.isEmpty == true ? nil : persistentDaemonSlot,
-                skipDaemonBootstrap: skipDaemonBootstrap
+                skipDaemonBootstrap: skipDaemonBootstrap,
+                execCommand: execCommand,
+                execEnvironment: execEnvironment,
+                remoteDaemonPath: remoteDaemonPath?.isEmpty == true ? nil : remoteDaemonPath,
+                skipDaemonUpload: skipDaemonUpload
             )
             workspace.configureRemoteConnection(config, autoConnect: autoConnect)
             notifyRemotePTYControllerAvailabilityChanged()

@@ -83,6 +83,11 @@ private enum WorkspaceRemoteSSHOptionFilter {
 nonisolated enum WorkspaceRemoteTransport: String, Codable, Equatable, Sendable {
     case ssh
     case websocket
+    /// Generic transport: cmux spawns a user-supplied command whose stdio carries the daemon
+    /// RPC, instead of `/usr/bin/ssh`. Same pattern as `ssh ProxyCommand` / `git core.sshCommand`,
+    /// but works even when the remote isn't reachable by stock ssh (e.g. `kubectl exec`,
+    /// `docker exec`, AWS SSM, or corp ssh wrappers). Configured via `execCommand`/`execEnvironment`.
+    case exec
 }
 
 nonisolated struct SessionRemoteWorkspaceSnapshot: Codable, Equatable, Sendable {
@@ -328,6 +333,17 @@ struct WorkspaceRemoteConfiguration: Equatable {
     /// a `DaemonHello`. Reverse-relay still stays off, but SSH-backed VM workspaces can talk to
     /// the baked daemon through an SSH local forward to `/run/cmuxd-remote.sock`.
     let skipDaemonBootstrap: Bool
+    /// `.exec` transport only: the wrapper command argv whose stdio carries the daemon RPC,
+    /// e.g. `["docker", "exec", "-i", "<container>"]` or `["kubectl", "exec", "-i", "<pod>", "--"]`. Empty otherwise.
+    let execCommand: [String]
+    /// `.exec` transport only: extra environment variables for the spawned wrapper
+    /// (e.g. `["AWS_REGION": "us-east-1"]`). Merged over the inherited process environment.
+    let execEnvironment: [String: String]
+    /// `.exec` transport only: absolute path of the pre-placed `cmuxd-remote` binary on the remote.
+    let remoteDaemonPath: String?
+    /// Skip the probe + upload bootstrap and use a pre-placed daemon (`remoteDaemonPath`).
+    /// The live RPC client still performs a real `hello` handshake over the transport.
+    let skipDaemonUpload: Bool
 
     init(
         transport: WorkspaceRemoteTransport = .ssh,
@@ -346,7 +362,11 @@ struct WorkspaceRemoteConfiguration: Equatable {
         daemonWebSocketEndpoint: WorkspaceRemoteWebSocketDaemonEndpoint? = nil,
         preserveAfterTerminalExit: Bool = false,
         persistentDaemonSlot: String? = nil,
-        skipDaemonBootstrap: Bool = false
+        skipDaemonBootstrap: Bool = false,
+        execCommand: [String] = [],
+        execEnvironment: [String: String] = [:],
+        remoteDaemonPath: String? = nil,
+        skipDaemonUpload: Bool = false
     ) {
         self.transport = transport
         self.destination = destination
@@ -367,6 +387,10 @@ struct WorkspaceRemoteConfiguration: Equatable {
             ? WorkspaceRemoteSSHOptionFilter.normalizedPersistentDaemonSlot(persistentDaemonSlot)
             : nil
         self.skipDaemonBootstrap = skipDaemonBootstrap
+        self.execCommand = execCommand
+        self.execEnvironment = execEnvironment
+        self.remoteDaemonPath = remoteDaemonPath
+        self.skipDaemonUpload = skipDaemonUpload
     }
 
     /// Resolves the SSH agent socket to use for a remote configuration from an explicit socket or durable options.
@@ -603,6 +627,18 @@ extension WorkspaceRemoteConfiguration {
         }
         var environment = ProcessInfo.processInfo.environment
         environment["SSH_AUTH_SOCK"] = agentSocketPath
+        return environment
+    }
+
+    /// Environment for the `.exec` transport's spawned wrapper: inherited process environment
+    /// with `execEnvironment` merged on top. Returns `nil` when there are no overrides so the
+    /// child simply inherits the parent environment.
+    var execProcessEnvironment: [String: String]? {
+        guard !execEnvironment.isEmpty else { return nil }
+        var environment = ProcessInfo.processInfo.environment
+        for (key, value) in execEnvironment {
+            environment[key] = value
+        }
         return environment
     }
 

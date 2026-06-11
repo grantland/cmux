@@ -2968,6 +2968,102 @@ final class WorkspaceRemoteConnectionTests: XCTestCase {
         XCTAssertTrue(arguments.last?.contains("/remote/cmuxd-remote") ?? false)
     }
 
+    func testExecDaemonTransportInvocationBuildsWrappedDaemonCommand() {
+        let invocation = WorkspaceRemoteExecCommandBuilder.daemonTransportInvocation(
+            execCommand: ["docker", "exec", "-i", "ctr"],
+            remotePath: "/home/user/cmuxd-remote"
+        )
+
+        XCTAssertEqual(invocation?.executable, "docker")
+        XCTAssertEqual(
+            invocation?.arguments,
+            ["exec", "-i", "ctr", "/home/user/cmuxd-remote", "serve", "--stdio"]
+        )
+    }
+
+    func testExecDaemonTransportInvocationReturnsNilForEmptyExecCommand() {
+        XCTAssertNil(
+            WorkspaceRemoteExecCommandBuilder.daemonTransportInvocation(
+                execCommand: [],
+                remotePath: "/home/user/cmuxd-remote"
+            )
+        )
+    }
+
+    func testExecPlaceholderSubstitutionReplacesHostPortUser() {
+        XCTAssertEqual(
+            WorkspaceRemoteExecPlaceholders.substitute(
+                ["docker", "exec", "-i", "%host"], host: "ctr1", port: nil, user: nil
+            ),
+            ["docker", "exec", "-i", "ctr1"]
+        )
+        XCTAssertEqual(
+            WorkspaceRemoteExecPlaceholders.substitute(
+                ["ssh", "-p", "%port", "%user@%host"], host: "h", port: 2222, user: "u"
+            ),
+            ["ssh", "-p", "2222", "u@h"]
+        )
+        XCTAssertEqual(
+            WorkspaceRemoteExecPlaceholders.substitute(
+                ["cmd", "%port"], host: "h", port: nil, user: nil
+            ),
+            ["cmd", "%port"],
+            "%port is left literal when no port is supplied"
+        )
+        XCTAssertEqual(
+            WorkspaceRemoteExecPlaceholders.substitute(
+                ["%bogus", "%host"], host: "h", port: nil, user: nil
+            ),
+            ["%bogus", "h"],
+            "unknown placeholders are left untouched"
+        )
+        XCTAssertEqual(
+            WorkspaceRemoteExecPlaceholders.substitute(
+                ["TOKEN": "v-%host"], host: "h", port: nil, user: nil
+            ),
+            ["TOKEN": "v-h"]
+        )
+    }
+
+    func testExecProcessEnvironmentMergesOverridesOverInheritedEnvironment() {
+        let config = WorkspaceRemoteConfiguration(
+            transport: .exec,
+            destination: "ctr1",
+            port: nil,
+            identityFile: nil,
+            sshOptions: [],
+            localProxyPort: nil,
+            relayPort: nil,
+            relayID: nil,
+            relayToken: nil,
+            localSocketPath: nil,
+            terminalStartupCommand: nil,
+            execCommand: ["docker", "exec", "-i", "ctr1"],
+            execEnvironment: ["CMUX_TEST_EXEC_ENV": "marker"]
+        )
+        let env = config.execProcessEnvironment
+        XCTAssertEqual(env?["CMUX_TEST_EXEC_ENV"], "marker")
+        XCTAssertNotNil(env?["PATH"], "exec env inherits the parent process environment")
+    }
+
+    func testExecProcessEnvironmentIsNilWithoutOverrides() {
+        let config = WorkspaceRemoteConfiguration(
+            transport: .exec,
+            destination: "ctr1",
+            port: nil,
+            identityFile: nil,
+            sshOptions: [],
+            localProxyPort: nil,
+            relayPort: nil,
+            relayID: nil,
+            relayToken: nil,
+            localSocketPath: nil,
+            terminalStartupCommand: nil,
+            execCommand: ["docker", "exec"]
+        )
+        XCTAssertNil(config.execProcessEnvironment)
+    }
+
     func testDaemonTransportArgumentsReuseWhitespaceConfiguredControlPath() {
         let configuration = WorkspaceRemoteConfiguration(
             destination: "cmux-macmini",
